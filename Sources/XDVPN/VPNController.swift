@@ -199,6 +199,7 @@ final class VPNController: ObservableObject {
     private var pollTimer: Timer?
     private var connectionTask: Task<Void, Never>?
     private var connectionAttemptID: UUID?
+    private var startupCleanupTask: Task<String?, Never>?
 
     // 自动重连：纯决策逻辑在 XDVPNCore.ReconnectPolicy（已单测），
     // 这里只持有它 + 退避计时器 + 「是否处于自动重连流程」标志。
@@ -270,7 +271,12 @@ final class VPNController: ObservableObject {
         }
         // root 那套需要 sudoers 已配 —— 首次启动时 cleanup helper 还不存在，跳过
         if sudoConfigured {
-            runCleanupDetached(reason: "启动清理上次残余")
+            let task = runCleanupDetached(reason: "启动清理上次残余")
+            startupCleanupTask = task
+            Task { [weak self] in
+                _ = await task.value
+                self?.startupCleanupTask = nil
+            }
         }
         startPolling()
         registerSleepHook()
@@ -924,6 +930,7 @@ final class VPNController: ObservableObject {
         connectionAttemptID = attemptID
 
         let rootCleanupRequired = !proxyMode || sudoConfigured
+        let startupCleanupTask = self.startupCleanupTask
         let task = Task.detached { [weak self] in
             // 先清两种模式的所有残留 —— 用户可能从对方模式切过来，旧进程还在
             OpenConnectRunner.disconnectProxyMode()
@@ -931,6 +938,12 @@ final class VPNController: ObservableObject {
             // 连接
             let result: Result<Void, Error>
             do {
+                // init 的 self-heal 是唯一会在没有状态机 completion 的情况下先行 cleanup
+                // 的路径。显式等待它，不能依赖 NSLock 的非 FIFO 唤醒顺序。
+                if let startupCleanupTask,
+                   let cleanupErrorMessage = await startupCleanupTask.value {
+                    throw VPNError.cleanupFailed(cleanupErrorMessage)
+                }
                 if !silent { try await BiometricGate.ensure() }
                 if proxyMode {
                     if rootCleanupRequired { try OpenConnectRunner.cleanup() }
@@ -1628,10 +1641,11 @@ final class VPNController: ObservableObject {
     }
 
     /// 在后台跑 cleanup。只有成功才执行 completion；失败会停止自动重连并显式报错。
+    @discardableResult
     private func runCleanupDetached(
         reason: String,
         completion: (@MainActor () -> Void)? = nil
-    ) {
+    ) -> Task<String?, Never> {
         Task.detached { [weak self] in
             let cleanupError: Error?
             do {
@@ -1640,9 +1654,8 @@ final class VPNController: ObservableObject {
             } catch {
                 cleanupError = error
             }
-            // 兜底：cleanup helper 里也删了，这里再来一次无害
-            try? FileManager.default.removeItem(atPath: Self.splitConfPath)
-            try? FileManager.default.removeItem(atPath: Self.domainConfPath)
+            // split/domain 配置由 cleanup helper 在 root operation gate 内删除。
+            // 这里不能再删：新的 replaceConnection 可能已写入下一次连接的配置。
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 let cleanupSucceeded = cleanupError == nil
@@ -1668,6 +1681,7 @@ final class VPNController: ObservableObject {
                 }
                 _ = reason  // 目前不输出日志，保留参数便于后续加 os_log
             }
+            return cleanupError?.localizedDescription
         }
     }
 }

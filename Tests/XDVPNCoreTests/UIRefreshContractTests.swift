@@ -59,6 +59,21 @@ final class UIRefreshContractTests: XCTestCase {
         XCTAssertTrue(build.contains("RELEASE_NOTES.md"))
     }
 
+    func test_detachedCleanupCannotDeleteNewConnectionConfiguration() throws {
+        let controller = try source("Sources/XDVPN/VPNController.swift")
+
+        XCTAssertFalse(controller.contains("removeItem(atPath: Self.splitConfPath)"))
+        XCTAssertFalse(controller.contains("removeItem(atPath: Self.domainConfPath)"))
+    }
+
+    func test_connectionWaitsForStartupCleanup() throws {
+        let controller = try source("Sources/XDVPN/VPNController.swift")
+
+        XCTAssertTrue(controller.contains("startupCleanupTask = task"))
+        XCTAssertTrue(controller.contains("let startupCleanupTask = self.startupCleanupTask"))
+        XCTAssertTrue(controller.contains("await startupCleanupTask.value"))
+    }
+
     private func source(_ relativePath: String) throws -> String {
         let repositoryRoot = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent()
