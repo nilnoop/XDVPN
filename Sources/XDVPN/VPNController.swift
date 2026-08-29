@@ -1367,7 +1367,9 @@ final class VPNController: ObservableObject {
     }
 
     private func handleWillSleep() {
-        // willSleep 通知给应用 ~20s 窗口。cleanup 最多 12s，够用。
+        // willSleep 通知给应用 ~20s 窗口。cleanup 本身最多 12s，但它要先拿 root 串行门；
+        // 若此刻有连接事务在跑（cleanup 12s + connect 超时 30s），这里会在主线程上多等一轮。
+        // 所以先掐掉在途连接：pending 进程一死，事务立刻解开，门随即释放。
         // 睡眠场景由 shouldReconnectAfterWake 走另一条 reconnect 路径，
         // 取消掉这里 pollTick 触发的自动重连，避免两套机制打架
         cancelAutoReconnect()
@@ -1380,6 +1382,7 @@ final class VPNController: ObservableObject {
         } else {
             // 只在 sudo 已配 的情况下清；其他情况 noop 就行
             guard sudoConfigured, isConnected || OpenConnectRunner.isRunning else { return }
+            OpenConnectRunner.cancelPendingConnection()
             do {
                 try OpenConnectRunner.cleanup()
             } catch {
