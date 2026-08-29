@@ -5,9 +5,9 @@ import Foundation
 enum SudoersInstaller {
     /// 每次改 helper 脚本内容后递增。isInstalled 会校验磁盘上的版本号，
     /// 不匹配 → sudoConfigured=false → UI 自动提示"一键配置"覆盖升级。
-    // v12 was already shipped by the fork that exposed this failure. Skip to v13 so those
-    // installations cannot mistake the old cleanup helper for this fixed version.
-    static let helperVersion = 13
+    // 14 而不是 12/13：v12 已被某 fork 发布过，v13 被 PR #11 占用。取更大的号，
+    // 确保这两种安装都会把本机 helper 判为需要升级。
+    static let helperVersion = 14
 
     static let sudoersPath = "/etc/sudoers.d/xdvpn"
     static let privilegedHelperParentDir = "/Library/PrivilegedHelperTools"
@@ -30,6 +30,11 @@ enum SudoersInstaller {
     static let installedOpenConnectPath = "\(installedOpenConnectDir)/bin/openconnect"
     private static let installedOpenConnectVersionPath = "\(installedOpenConnectDir)/VERSION"
     private static let globalDNSStateKey = "State:/Network/Service/com.kafeifei.xdvpn/DNS"
+
+    /// 必须活过重启的状态。系统代理的「原本是开还是关」一旦被我们改掉就再也读不出来，
+    /// 是唯一丢了不可恢复的记录，不能放在会被 tmp_cleaner 扫掉的 /tmp。
+    static let persistentStateDir = "/Library/Application Support/XDVPN"
+    static let sysproxyStatePath = "\(persistentStateDir)/sysproxy.state"
 
     /// v0.2 的 helper，v0.3 安装时顺手删掉（用户从 0.2 升级时的清理）
     private static let legacyPaths = [
@@ -195,8 +200,33 @@ enum SudoersInstaller {
 
     SESSION="/tmp/xdvpn.session"
     GLOBAL_DNS_KEY="\#(globalDNSStateKey)"
+    # 路径写死，不需要记账
+    READY_FILE="/tmp/xdvpn-dns-proxy.ready"
+    # 必须活过重启：见 SudoersInstaller.persistentStateDir 的说明
+    SYSPROXY_STATE="\#(sysproxyStatePath)"
 
     append_state() { echo "$1" >> "$SESSION"; }
+
+    append_sysproxy_state() {
+        mkdir -p "\#(persistentStateDir)" 2>/dev/null || true
+        chmod 0700 "\#(persistentStateDir)" 2>/dev/null || true
+        echo "$1" >> "$SYSPROXY_STATE"
+        chmod 0600 "$SYSPROXY_STATE" 2>/dev/null || true
+    }
+
+    # 只追加、不截断：上一轮没恢复成功的记录仍然描述用户的真实原始状态，必须保留。
+    # 重复项无害——把已经开着的代理再开一次是幂等的。
+    restore_sysproxy() {
+        [ -f "$SYSPROXY_STATE" ] || return 0
+        while IFS='=' read -r tag val; do
+            case "$tag" in
+              SYSPROXY_WEB)    networksetup -setwebproxystate "$val" on 2>/dev/null || true ;;
+              SYSPROXY_SECURE) networksetup -setsecurewebproxystate "$val" on 2>/dev/null || true ;;
+              SYSPROXY_SOCKS)  networksetup -setsocksfirewallproxystate "$val" on 2>/dev/null || true ;;
+            esac
+        done < "$SYSPROXY_STATE"
+        rm -f "$SYSPROXY_STATE"
+    }
 
     remove_xdvpn_resolver() {
         file="$1"
@@ -304,13 +334,13 @@ enum SudoersInstaller {
             networksetup -listallnetworkservices 2>/dev/null | while IFS= read -r svc; do
                 case "$svc" in ''|'An asterisk'*|'*'*) continue ;; esac
                 if networksetup -getwebproxy "$svc" 2>/dev/null | grep -q '^Enabled: Yes'; then
-                    networksetup -setwebproxystate "$svc" off 2>/dev/null && append_state "SYSPROXY_WEB=$svc"
+                    networksetup -setwebproxystate "$svc" off 2>/dev/null && append_sysproxy_state "SYSPROXY_WEB=$svc"
                 fi
                 if networksetup -getsecurewebproxy "$svc" 2>/dev/null | grep -q '^Enabled: Yes'; then
-                    networksetup -setsecurewebproxystate "$svc" off 2>/dev/null && append_state "SYSPROXY_SECURE=$svc"
+                    networksetup -setsecurewebproxystate "$svc" off 2>/dev/null && append_sysproxy_state "SYSPROXY_SECURE=$svc"
                 fi
                 if networksetup -getsocksfirewallproxy "$svc" 2>/dev/null | grep -q '^Enabled: Yes'; then
-                    networksetup -setsocksfirewallproxystate "$svc" off 2>/dev/null && append_state "SYSPROXY_SOCKS=$svc"
+                    networksetup -setsocksfirewallproxystate "$svc" off 2>/dev/null && append_sysproxy_state "SYSPROXY_SOCKS=$svc"
                 fi
             done
         fi
@@ -324,7 +354,7 @@ enum SudoersInstaller {
                 # 杀掉上一次残留的 dns-proxy（升级、异常退出等场景可能留下孤儿进程占住端口 53）
                 pkill -x xdvpn-dns-proxy 2>/dev/null || true
                 sleep 0.2
-                READY="/tmp/xdvpn-dns-proxy.ready"
+                READY="$READY_FILE"
                 rm -f "$READY"
                 nohup "$DNS_PROXY" --vpn-dns "$VPN_DNS" --utun "$TUNDEV" \
                     --domains "$DOMAIN_CONF" --ready-file "$READY" </dev/null >/dev/null 2>&1 &
@@ -341,7 +371,6 @@ enum SudoersInstaller {
                 done
                 if [ "$READY_OK" = "1" ]; then
                     append_state "DNS_PROXY_PID=$DNS_PROXY_PID"
-                    append_state "DNS_PROXY_READY=$READY"
                     append_resolver_state_from_domain_conf "$DOMAIN_CONF"
                     dscacheutil -flushcache
                     killall -HUP mDNSResponder 2>/dev/null || true
@@ -367,8 +396,7 @@ enum SudoersInstaller {
     set ${SCUTIL_KEY}
     quit
     SCUTIL_EOF
-            append_state "SCUTIL_KEY=$SCUTIL_KEY"
-        fi
+            fi
         ;;
 
       disconnect)
@@ -389,7 +417,6 @@ enum SudoersInstaller {
             while IFS='=' read -r tag val; do
                 case "$tag" in
                   RESOLVER_FILE) remove_xdvpn_resolver "$val" ;;
-                  DNS_PROXY_READY) rm -f "$val" ;;
                 esac
             done < "$SESSION"
             # 读 TUNDEV 用来删路由
@@ -408,26 +435,20 @@ enum SudoersInstaller {
                 esac
             done < "$SESSION"
 
-            # 系统代理恢复（只恢复 connect 时我们关过的那几条）
-            while IFS='=' read -r tag val; do
-                case "$tag" in
-                  SYSPROXY_WEB)    networksetup -setwebproxystate "$val" on 2>/dev/null || true ;;
-                  SYSPROXY_SECURE) networksetup -setsecurewebproxystate "$val" on 2>/dev/null || true ;;
-                  SYSPROXY_SOCKS)  networksetup -setsocksfirewallproxystate "$val" on 2>/dev/null || true ;;
-                esac
-            done < "$SESSION"
-
             rm -f "$SESSION"
         fi
 
-        # 固定 key 只属于 XDVPN。不能依赖 session：进程崩溃或 session 损坏时，
-        # 残留的全局 VPN DNS 会让本机解析和后续 VPN 重连互相死锁。
+        # 下面这些都不看 session：固定 key 只属于 XDVPN，ready 文件路径是写死的，
+        # 系统代理记录在独立的持久文件里。进程崩溃或 session 丢失时残留的全局 VPN DNS
+        # 会让本机解析和后续重连互相死锁，必须无条件清。
         scutil <<SCUTIL_REM_EOF >/dev/null
     remove ${GLOBAL_DNS_KEY}
     quit
     SCUTIL_REM_EOF
         dscacheutil -flushcache
         killall -HUP mDNSResponder 2>/dev/null || true
+        rm -f "$READY_FILE"
+        restore_sysproxy
         # utun 接口会在 openconnect close fd 时被 kernel 自动销毁
         ;;
 
@@ -452,6 +473,26 @@ enum SudoersInstaller {
     PID_FILE="/tmp/xdvpn.pid"
     SESSION="/tmp/xdvpn.session"
     GLOBAL_DNS_KEY="\#(globalDNSStateKey)"
+    # XDVPN 启的 openconnect 命令行里一定带这一串，本机独占：用户自己装的 openconnect
+    # 不会带它；正在跑的 route script 自身命令行是裸路径，不含 "--script=" 前缀，不会误伤。
+    OC_SIGNATURE="--script=\#(routeScriptPath)"
+    # 路径写死，不需要记账
+    READY_FILE="/tmp/xdvpn-dns-proxy.ready"
+    # 必须活过重启：见 SudoersInstaller.persistentStateDir 的说明
+    SYSPROXY_STATE="\#(sysproxyStatePath)"
+
+    # 只追加、不截断：上一轮没恢复成功的记录仍然描述用户的真实原始状态。
+    restore_sysproxy() {
+        [ -f "$SYSPROXY_STATE" ] || return 0
+        while IFS='=' read -r tag val; do
+            case "$tag" in
+              SYSPROXY_WEB)    networksetup -setwebproxystate "$val" on 2>/dev/null || true ;;
+              SYSPROXY_SECURE) networksetup -setsecurewebproxystate "$val" on 2>/dev/null || true ;;
+              SYSPROXY_SOCKS)  networksetup -setsocksfirewallproxystate "$val" on 2>/dev/null || true ;;
+            esac
+        done < "$SYSPROXY_STATE"
+        rm -f "$SYSPROXY_STATE"
+    }
 
     remove_xdvpn_resolver() {
         file="$1"
@@ -464,26 +505,35 @@ enum SudoersInstaller {
         fi
     }
 
-    # 1) 停 openconnect（按 pid 精确杀，不 killall）
+    # SIGTERM 让 openconnect 走 --script=disconnect 路径清干净；12s 不死再 SIGKILL
+    # （是我们自己启动的进程，有权杀）。
+    stop_openconnect() {
+        _pid="$1"
+        kill -TERM "$_pid" 2>/dev/null || true
+        for _ in $(seq 1 60); do
+            kill -0 "$_pid" 2>/dev/null || break
+            sleep 0.2
+        done
+        kill -KILL "$_pid" 2>/dev/null || true
+    }
+
+    # 1) 停 openconnect。pid 文件只是快路径：/tmp 会被 tmp_cleaner 定期扫，
+    #    长时间保持连接后它可能已经不在了，不能当唯一依据。真正的判据是命令行特征。
     if [ -s "$PID_FILE" ]; then
         PID="$(cat "$PID_FILE" 2>/dev/null | tr -d ' \t\r\n')"
         if [ -n "$PID" ]; then
             # 校验是不是 openconnect（pid 可能被复用给了别的进程）
             COMM="$(ps -o comm= -p "$PID" 2>/dev/null || true)"
-            if echo "$COMM" | grep -q openconnect; then
-                # SIGTERM 让 openconnect 走 --script=disconnect 路径清干净
-                kill -TERM "$PID" 2>/dev/null || true
-                # 最多等 12s
-                for _ in $(seq 1 60); do
-                    kill -0 "$PID" 2>/dev/null || break
-                    sleep 0.2
-                done
-                # 还没死就 SIGKILL（是我们自己启动的进程，有权杀）
-                kill -KILL "$PID" 2>/dev/null || true
-            fi
+            case "$COMM" in
+              *openconnect*) stop_openconnect "$PID" ;;
+            esac
         fi
         rm -f "$PID_FILE"
     fi
+    # 固定身份兜底：pid 文件丢了也一定能找到我们自己的 openconnect
+    for _oc in $(pgrep -f -- "$OC_SIGNATURE" 2>/dev/null || true); do
+        stop_openconnect "$_oc"
+    done
 
     # 停 dns-proxy（从 session 读 PID + 兜底 pkill）
     if [ -f "$SESSION" ]; then
@@ -500,7 +550,6 @@ enum SudoersInstaller {
         while IFS='=' read -r tag val; do
             case "$tag" in
               RESOLVER_FILE) remove_xdvpn_resolver "$val" ;;
-              DNS_PROXY_READY) rm -f "$val" ;;
             esac
         done < "$SESSION"
         dscacheutil -flushcache
@@ -508,6 +557,7 @@ enum SudoersInstaller {
     fi
     # 兜底：杀掉任何残留的 dns-proxy（升级遗留、session 丢失等）
     pkill -x xdvpn-dns-proxy 2>/dev/null || true
+    rm -f "$READY_FILE"
     # 兜底：清理 XDVPN 管理的 resolver 文件
     for f in /etc/resolver/*; do
         [ -f "$f" ] && remove_xdvpn_resolver "$f"
@@ -554,17 +604,12 @@ enum SudoersInstaller {
             ifconfig "$TD" destroy 2>/dev/null || true
         fi
 
-        # 系统代理恢复（崩溃 / 强杀后兜底；只恢复 connect 时我们关过的那几条）
-        while IFS='=' read -r tag val; do
-            case "$tag" in
-              SYSPROXY_WEB)    networksetup -setwebproxystate "$val" on 2>/dev/null || true ;;
-              SYSPROXY_SECURE) networksetup -setsecurewebproxystate "$val" on 2>/dev/null || true ;;
-              SYSPROXY_SOCKS)  networksetup -setsocksfirewallproxystate "$val" on 2>/dev/null || true ;;
-            esac
-        done < "$SESSION"
-
         rm -f "$SESSION"
     fi
+
+    # 系统代理恢复：记录在独立的持久文件里，session 在不在都要做。
+    # 这是唯一丢了不可恢复的状态——漏一次，用户的代理就再也开不回去。
+    restore_sysproxy
 
     # 3) 清掉分流配置文件（下次连接会由 XDVPN 按当前 UI 状态重新写）
     rm -f "/tmp/xdvpn-split.conf" "/tmp/xdvpn-split-domains.conf"
@@ -613,6 +658,11 @@ enum SudoersInstaller {
         mkdir -p '\(helperDir)'
         chown root:wheel '\(helperDir)'
         chmod 0755 '\(helperDir)'
+
+        # 必须活过重启的状态目录（系统代理原值）
+        mkdir -p '\(persistentStateDir)'
+        chown root:wheel '\(persistentStateDir)'
+        chmod 0700 '\(persistentStateDir)'
 
         # 清 v0.2 旧文件（升级路径）
         rm -f \(legacyPaths.map { "'\($0)'" }.joined(separator: " "))
