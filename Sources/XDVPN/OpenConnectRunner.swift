@@ -1,4 +1,5 @@
 import Foundation
+import XDVPNCore
 
 private final class PendingConnectionProcess: @unchecked Sendable {
     private let lock = NSLock()
@@ -57,16 +58,55 @@ enum OpenConnectRunner {
     /// 纯代理模式独立 pid 文件（无 sudo，user-owned）
     static let proxyModePidPath = "/tmp/xdvpn-proxy.pid"
     private static let pendingConnection = PendingConnectionProcess()
+    private static let rootTunnelOperationGate = ExclusiveOperationGate()
     private static let connectionTimeout: TimeInterval = 30
 
     static let protocols = ["anyconnect", "nc", "gp", "pulse", "f5", "fortinet", "array"]
 
     // MARK: - Connect
 
-    /// 启动 openconnect。--background 让它在建好隧道、跑完 route-script 之后再 fork。
+    /// 清掉旧隧道后启动 openconnect。--background 让它在建好隧道、跑完 route-script 之后再 fork。
     /// 所以本函数返回 = 连接已建立 + session.state 已写好。
     /// 调用线程：**不要**在 MainActor 上跑（会阻塞 UI）。
     static func connect(
+        protocolName: String,
+        server: String,
+        user: String,
+        password: String
+    ) throws {
+        try replaceConnection(
+            protocolName: protocolName,
+            server: server,
+            user: user,
+            password: password
+        ) {
+            // Callers without split/domain configuration still get the same atomic
+            // cleanup -> connect transaction and cannot bypass the operation gate.
+        }
+    }
+
+    /// Atomically replaces a privileged tunnel. `prepare` writes the split/domain files
+    /// after stale state is gone and before openconnect's route script reads them.
+    static func replaceConnection(
+        protocolName: String,
+        server: String,
+        user: String,
+        password: String,
+        prepare: () throws -> Void
+    ) throws {
+        try rootTunnelOperationGate.perform {
+            try cleanupUnlocked()
+            try prepare()
+            try connectUnlocked(
+                protocolName: protocolName,
+                server: server,
+                user: user,
+                password: password
+            )
+        }
+    }
+
+    private static func connectUnlocked(
         protocolName: String,
         server: String,
         user: String,
@@ -122,6 +162,12 @@ enum OpenConnectRunner {
     /// 幂等、安全、可在任何时机反复调（启动时 / 用户点断开 / 合盖前）。
     /// 调用线程：不要在 MainActor（阻塞最多 ~12s 等 vpnc-script 回收）。
     static func cleanup() throws {
+        try rootTunnelOperationGate.perform {
+            try cleanupUnlocked()
+        }
+    }
+
+    private static func cleanupUnlocked() throws {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
         proc.arguments = ["-n", SudoersInstaller.cleanupPath]

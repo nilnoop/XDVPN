@@ -5,7 +5,9 @@ import Foundation
 enum SudoersInstaller {
     /// 每次改 helper 脚本内容后递增。isInstalled 会校验磁盘上的版本号，
     /// 不匹配 → sudoConfigured=false → UI 自动提示"一键配置"覆盖升级。
-    static let helperVersion = 11
+    // v12 was already shipped by the fork that exposed this failure. Skip to v13 so those
+    // installations cannot mistake the old cleanup helper for this fixed version.
+    static let helperVersion = 13
 
     static let sudoersPath = "/etc/sudoers.d/xdvpn"
     static let privilegedHelperParentDir = "/Library/PrivilegedHelperTools"
@@ -27,6 +29,7 @@ enum SudoersInstaller {
     static let installedOpenConnectDir = "\(helperDir)/openconnect"
     static let installedOpenConnectPath = "\(installedOpenConnectDir)/bin/openconnect"
     private static let installedOpenConnectVersionPath = "\(installedOpenConnectDir)/VERSION"
+    private static let globalDNSStateKey = "State:/Network/Service/com.kafeifei.xdvpn/DNS"
 
     /// v0.2 的 helper，v0.3 安装时顺手删掉（用户从 0.2 升级时的清理）
     private static let legacyPaths = [
@@ -191,6 +194,7 @@ enum SudoersInstaller {
     set -u
 
     SESSION="/tmp/xdvpn.session"
+    GLOBAL_DNS_KEY="\#(globalDNSStateKey)"
 
     append_state() { echo "$1" >> "$SESSION"; }
 
@@ -349,7 +353,7 @@ enum SudoersInstaller {
             fi
         elif [ -n "${INTERNAL_IP4_DNS:-}" ]; then
             # 原有全局 DNS 注入（无域名分流时）
-            SCUTIL_KEY="State:/Network/Service/com.kafeifei.xdvpn/DNS"
+            SCUTIL_KEY="$GLOBAL_DNS_KEY"
             DNS_VALUES="*"
             for d in $INTERNAL_IP4_DNS; do
                 DNS_VALUES="$DNS_VALUES $d"
@@ -388,21 +392,6 @@ enum SudoersInstaller {
                   DNS_PROXY_READY) rm -f "$val" ;;
                 esac
             done < "$SESSION"
-            dscacheutil -flushcache
-            killall -HUP mDNSResponder 2>/dev/null || true
-
-            # DNS
-            KEY=""
-            while IFS='=' read -r tag val; do
-                [ "$tag" = "SCUTIL_KEY" ] && KEY="$val"
-            done < "$SESSION"
-            if [ -n "$KEY" ]; then
-                scutil <<SCUTIL_REM_EOF
-    remove ${KEY}
-    quit
-    SCUTIL_REM_EOF
-            fi
-
             # 读 TUNDEV 用来删路由
             TD=""
             while IFS='=' read -r tag val; do
@@ -430,6 +419,15 @@ enum SudoersInstaller {
 
             rm -f "$SESSION"
         fi
+
+        # 固定 key 只属于 XDVPN。不能依赖 session：进程崩溃或 session 损坏时，
+        # 残留的全局 VPN DNS 会让本机解析和后续 VPN 重连互相死锁。
+        scutil <<SCUTIL_REM_EOF >/dev/null
+    remove ${GLOBAL_DNS_KEY}
+    quit
+    SCUTIL_REM_EOF
+        dscacheutil -flushcache
+        killall -HUP mDNSResponder 2>/dev/null || true
         # utun 接口会在 openconnect close fd 时被 kernel 自动销毁
         ;;
 
@@ -453,6 +451,7 @@ enum SudoersInstaller {
 
     PID_FILE="/tmp/xdvpn.pid"
     SESSION="/tmp/xdvpn.session"
+    GLOBAL_DNS_KEY="\#(globalDNSStateKey)"
 
     remove_xdvpn_resolver() {
         file="$1"
@@ -514,22 +513,29 @@ enum SudoersInstaller {
         [ -f "$f" ] && remove_xdvpn_resolver "$f"
     done 2>/dev/null || true
 
+    # 全局 DNS key 是 XDVPN 独占的固定资源，必须无条件清理。session 可能在
+    # openconnect crash、强杀或并发退出时缺失，不能拿它当清理前提。
+    scutil <<EOF >/dev/null
+    remove ${GLOBAL_DNS_KEY}
+    quit
+    EOF
+    DNS_STATE="$(scutil <<EOF 2>&1
+    show ${GLOBAL_DNS_KEY}
+    quit
+    EOF
+    )"
+    DNS_CLEANUP_FAILED=0
+    case "$DNS_STATE" in
+      *"No such key"*) ;;
+      *) DNS_CLEANUP_FAILED=1 ;;
+    esac
+    dscacheutil -flushcache
+    killall -HUP mDNSResponder 2>/dev/null || true
+
     # openconnect 退出 → kernel close tun fd → utun 销毁 → interface-scoped 路由自动跟着清掉
 
     # 2) 如果 disconnect script 没跑完（openconnect 被 SIGKILL / crash），手动清残留
     if [ -f "$SESSION" ]; then
-        # DNS（这个不是 interface-scoped，kernel 不会清）
-        KEY=""
-        while IFS='=' read -r tag val; do
-            [ "$tag" = "SCUTIL_KEY" ] && KEY="$val"
-        done < "$SESSION"
-        if [ -n "$KEY" ]; then
-            scutil <<EOF
-    remove ${KEY}
-    quit
-    EOF
-        fi
-
         # VPN 网关 host route（也不是 interface-scoped）
         while IFS='=' read -r tag val; do
             [ "$tag" = "ROUTE_HOST" ] && route delete -host "$val" 2>/dev/null || true
@@ -562,6 +568,11 @@ enum SudoersInstaller {
 
     # 3) 清掉分流配置文件（下次连接会由 XDVPN 按当前 UI 状态重新写）
     rm -f "/tmp/xdvpn-split.conf" "/tmp/xdvpn-split-domains.conf"
+
+    if [ "$DNS_CLEANUP_FAILED" -ne 0 ]; then
+        echo "failed to remove XDVPN global DNS state" >&2
+        exit 1
+    fi
 
     exit 0
     """#

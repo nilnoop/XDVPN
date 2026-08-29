@@ -199,6 +199,7 @@ final class VPNController: ObservableObject {
     private var pollTimer: Timer?
     private var connectionTask: Task<Void, Never>?
     private var connectionAttemptID: UUID?
+    private var startupCleanupTask: Task<String?, Never>?
 
     // 自动重连：纯决策逻辑在 XDVPNCore.ReconnectPolicy（已单测），
     // 这里只持有它 + 退避计时器 + 「是否处于自动重连流程」标志。
@@ -270,7 +271,12 @@ final class VPNController: ObservableObject {
         }
         // root 那套需要 sudoers 已配 —— 首次启动时 cleanup helper 还不存在，跳过
         if sudoConfigured {
-            runCleanupDetached(reason: "启动清理上次残余")
+            let task = runCleanupDetached(reason: "启动清理上次残余")
+            startupCleanupTask = task
+            Task { [weak self] in
+                _ = await task.value
+                self?.startupCleanupTask = nil
+            }
         }
         startPolling()
         registerSleepHook()
@@ -923,30 +929,39 @@ final class VPNController: ObservableObject {
         let attemptID = UUID()
         connectionAttemptID = attemptID
 
+        let rootCleanupRequired = !proxyMode || sudoConfigured
+        let startupCleanupTask = self.startupCleanupTask
         let task = Task.detached { [weak self] in
             // 先清两种模式的所有残留 —— 用户可能从对方模式切过来，旧进程还在
             OpenConnectRunner.disconnectProxyMode()
-            try? OpenConnectRunner.cleanup()  // 即使 proxyMode，前一次标准模式的 root 进程也得清
-
-            guard !Task.isCancelled else { return }
-
-            if !proxyMode {
-                Self.writeSplitConfFile(enabled: splitOn, cidrs: splitCIDRs)
-                Self.writeDomainConfFile(enabled: splitOn, domains: domainSuffixes)
-            }
 
             // 连接
             let result: Result<Void, Error>
             do {
+                // init 的 self-heal 是唯一会在没有状态机 completion 的情况下先行 cleanup
+                // 的路径。显式等待它，不能依赖 NSLock 的非 FIFO 唤醒顺序。
+                if let startupCleanupTask,
+                   let cleanupErrorMessage = await startupCleanupTask.value {
+                    throw VPNError.cleanupFailed(cleanupErrorMessage)
+                }
                 if !silent { try await BiometricGate.ensure() }
                 if proxyMode {
+                    if rootCleanupRequired { try OpenConnectRunner.cleanup() }
+                    guard !Task.isCancelled else { return }
                     try OpenConnectRunner.connectProxyMode(
                         protocolName: p, server: s, user: u, password: pw, socksPort: socksPort
                     )
                 } else {
-                    try OpenConnectRunner.connect(
-                        protocolName: p, server: s, user: u, password: pw
-                    )
+                    try OpenConnectRunner.replaceConnection(
+                        protocolName: p,
+                        server: s,
+                        user: u,
+                        password: pw
+                    ) {
+                        guard !Task.isCancelled else { throw CancellationError() }
+                        Self.writeSplitConfFile(enabled: splitOn, cidrs: splitCIDRs)
+                        Self.writeDomainConfFile(enabled: splitOn, domains: domainSuffixes)
+                    }
                 }
                 result = .success(())
             } catch {
@@ -998,7 +1013,11 @@ final class VPNController: ObservableObject {
                     }
                     self.isConnected = false
                     self.activeMode = nil
-                    if silent, self.isAutoReconnecting {
+                    if case VPNError.cleanupFailed = err {
+                        self.cancelAutoReconnect()
+                        self.statusText = "网络清理失败，已停止重连：\(err.localizedDescription)"
+                        appLog(.error, self.statusText)
+                    } else if silent, self.isAutoReconnecting {
                         // 自动重连这次失败 → 沿退避链推进，而不是停在未连接（修硬失败单次放弃）
                         appLog(.error, "自动重连尝试失败：\(err.localizedDescription)")
                         self.applyReconnectCommand(self.policy.onReconnectAttemptFailed(now: Date()))
@@ -1073,14 +1092,31 @@ final class VPNController: ObservableObject {
 
         Task.detached { [weak self] in
             OpenConnectRunner.cancelPendingConnection()
+            let cleanupSucceeded: Bool
+            let cleanupErrorMessage: String?
             if mode == .proxy {
                 OpenConnectRunner.disconnectProxyMode()
+                cleanupSucceeded = true
+                cleanupErrorMessage = nil
             } else {
-                try? OpenConnectRunner.cleanup()
+                do {
+                    try OpenConnectRunner.cleanup()
+                    cleanupSucceeded = true
+                    cleanupErrorMessage = nil
+                } catch {
+                    cleanupSucceeded = false
+                    cleanupErrorMessage = error.localizedDescription
+                }
             }
             await MainActor.run { [weak self] in
                 guard let self, self.connectionAttemptID == nil else { return }
                 self.isBusy = false
+                guard cleanupSucceeded else {
+                    self.cancelAutoReconnect()
+                    self.statusText = "网络清理失败，已停止重连：\(cleanupErrorMessage ?? "未知错误")"
+                    appLog(.error, "取消连接：\(self.statusText)")
+                    return
+                }
                 self.statusText = status
                 if reconnectAfterCleanup { self.onTunnelLost() }
             }
@@ -1098,7 +1134,7 @@ final class VPNController: ObservableObject {
                     try SudoersInstaller.install()
                     // 装完之后同步跑一次 cleanup，顺手把 v0.2 残余（如果有）也清了。
                     // 完成后才允许自动连接，避免后台 cleanup 删掉新连接的 split/domain conf。
-                    try? OpenConnectRunner.cleanup()
+                    try OpenConnectRunner.cleanup()
                     return nil
                 }
                 catch { return error.localizedDescription }
@@ -1110,7 +1146,7 @@ final class VPNController: ObservableObject {
                 if let errMsg { self.statusText = errMsg }
                 else if !self.isConnected { self.statusText = "未连接" }
                 // 配置成功 + 凭据齐全 → 自动连接
-                if thenConnect, self.canConnect {
+                if errMsg == nil, thenConnect, self.canConnect {
                     self.connect()
                 }
             }
@@ -1344,7 +1380,18 @@ final class VPNController: ObservableObject {
         } else {
             // 只在 sudo 已配 的情况下清；其他情况 noop 就行
             guard sudoConfigured, isConnected || OpenConnectRunner.isRunning else { return }
-            try? OpenConnectRunner.cleanup()
+            do {
+                try OpenConnectRunner.cleanup()
+            } catch {
+                shouldReconnectAfterWake = false
+                cancelAutoReconnect()
+                isConnected = false
+                activeMode = nil
+                clearDiagnostics()
+                statusText = "网络清理失败，唤醒后不会重连：\(error.localizedDescription)"
+                appLog(.error, statusText)
+                return
+            }
         }
         isConnected = false
         activeMode = nil
@@ -1593,18 +1640,34 @@ final class VPNController: ObservableObject {
         }
     }
 
-    /// 在后台跑 cleanup，成功/失败都更新一下 isConnected / statusText。
+    /// 在后台跑 cleanup。只有成功才执行 completion；失败会停止自动重连并显式报错。
+    @discardableResult
     private func runCleanupDetached(
         reason: String,
         completion: (@MainActor () -> Void)? = nil
-    ) {
+    ) -> Task<String?, Never> {
         Task.detached { [weak self] in
-            try? OpenConnectRunner.cleanup()
-            // 兜底：cleanup helper 里也删了，这里再来一次无害
-            try? FileManager.default.removeItem(atPath: Self.splitConfPath)
-            try? FileManager.default.removeItem(atPath: Self.domainConfPath)
+            let cleanupError: Error?
+            do {
+                try OpenConnectRunner.cleanup()
+                cleanupError = nil
+            } catch {
+                cleanupError = error
+            }
+            // split/domain 配置由 cleanup helper 在 root operation gate 内删除。
+            // 这里不能再删：新的 replaceConnection 可能已写入下一次连接的配置。
             await MainActor.run { [weak self] in
                 guard let self else { return }
+                let cleanupSucceeded = cleanupError == nil
+                guard cleanupSucceeded else {
+                    self.cancelAutoReconnect()
+                    self.isConnected = false
+                    self.activeMode = nil
+                    self.isBusy = false
+                    self.statusText = "网络清理失败，已停止重连：\(cleanupError?.localizedDescription ?? "未知错误")"
+                    appLog(.error, "\(reason)：\(self.statusText)")
+                    return
+                }
                 // 不改 isBusy —— 启动期间的 cleanup 是静默的，不应该锁 UI
                 if let completion { completion() }
                 else {
@@ -1618,6 +1681,7 @@ final class VPNController: ObservableObject {
                 }
                 _ = reason  // 目前不输出日志，保留参数便于后续加 os_log
             }
+            return cleanupError?.localizedDescription
         }
     }
 }
