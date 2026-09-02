@@ -35,7 +35,7 @@ extension EnvironmentValues {
 // MARK: - Menu bar icon
 //
 // 始终 template image：
-//   - 白底（RGB ≥ 245）alpha 置 0，让 macOS template 渲染只看到 blob 轮廓
+//   - 忽略透明画布，并将白底 alpha 置 0，让 macOS template 渲染只看到 blob 轮廓
 //   - 裁掉透明边距，输出 16pt 高的 NSImage，和 Surge 这类原生菜单栏图标对齐
 //
 // 颜色逻辑放在 NSStatusBarButton.contentTintColor：
@@ -79,14 +79,20 @@ enum MenuBarIcon {
         guard let raw = ctx.data else { return nil }
         let buf = raw.bindMemory(to: UInt8.self, capacity: bytesPerRow * workSize)
 
-        // 白底打透明 + 统计 bbox（CGImage top-left 坐标）
+        // 透明画布和白底不参与 bbox（CGImage top-left 坐标）。
+        // 位图是 premultiplied alpha，圆角边缘的白色像素 RGB 会随 alpha 降低，
+        // 因此需要相对 alpha 判断白色，不能只比较固定 RGB 阈值。
         let threshold: UInt8 = 245
         var minX = workSize, minY = workSize, maxX = -1, maxY = -1
         for y in 0..<workSize {
             for x in 0..<workSize {
                 let i = y * bytesPerRow + x * 4
-                let r = buf[i], g = buf[i + 1], b = buf[i + 2]
-                if r >= threshold && g >= threshold && b >= threshold {
+                let r = buf[i], g = buf[i + 1], b = buf[i + 2], a = buf[i + 3]
+                let whiteThreshold = Int(a) * Int(threshold) / 255
+                if a == 0
+                    || (Int(r) >= whiteThreshold
+                        && Int(g) >= whiteThreshold
+                        && Int(b) >= whiteThreshold) {
                     buf[i] = 0; buf[i + 1] = 0; buf[i + 2] = 0; buf[i + 3] = 0
                 } else {
                     if x < minX { minX = x }
